@@ -265,6 +265,11 @@ type Server struct {
 	//     * cONTENT-lenGTH -> Content-Length
 	DisableHeaderNamesNormalizing bool
 
+	// ConnState specifies an optional callback function that is
+	// called when a client connection changes state. See the
+	// ConnState type and associated constants for details.
+	ConnState func(net.Conn, ConnState)
+
 	// Logger, which is used by RequestCtx.Logger().
 	//
 	// By default standard logger from log package is used.
@@ -280,6 +285,56 @@ type Server struct {
 	writerPool     sync.Pool
 	hijackConnPool sync.Pool
 	bytePool       sync.Pool
+}
+
+type ConnState int
+
+const (
+	// StateNew represents a new connection that is expected to
+	// send a request immediately. Connections begin at this
+	// state and then transition to either StateActive or
+	// StateClosed.
+	StateNew ConnState = iota
+
+	// StateActive represents a connection that has read 1 or more
+	// bytes of a request. The Server.ConnState hook for
+	// StateActive fires before the request has entered a handler
+	// and doesn't fire again until the request has been
+	// handled. After the request is handled, the state
+	// transitions to StateClosed, StateHijacked, or StateIdle.
+	// For HTTP/2, StateActive fires on the transition from zero
+	// to one active request, and only transitions away once all
+	// active requests are complete. That means that ConnState
+	// cannot be used to do per-request work; ConnState only notes
+	// the overall state of the connection.
+	StateActive
+
+	// StateIdle represents a connection that has finished
+	// handling a request and is in the keep-alive state, waiting
+	// for a new request. Connections transition from StateIdle
+	// to either StateActive or StateClosed.
+	StateIdle
+
+	// StateHijacked represents a hijacked connection.
+	// This is a terminal state. It does not transition to StateClosed.
+	StateHijacked
+
+	// StateClosed represents a closed connection.
+	// This is a terminal state. Hijacked connections do not
+	// transition to StateClosed.
+	StateClosed
+)
+
+var stateName = map[ConnState]string{
+	StateNew:      "new",
+	StateActive:   "active",
+	StateIdle:     "idle",
+	StateHijacked: "hijacked",
+	StateClosed:   "closed",
+}
+
+func (c ConnState) String() string {
+	return stateName[c]
 }
 
 // TimeoutHandler creates RequestHandler, which returns StatusRequestTimeout
@@ -1125,6 +1180,12 @@ func (ctx *RequestCtx) TimeoutErrorWithResponse(resp *Response) {
 	ctx.timeoutResponse = respCopy
 }
 
+func (s *Server) setState(c net.Conn, cs ConnState) {
+	if hook := s.ConnState; hook != nil {
+		hook(c, cs)
+	}
+}
+
 // ListenAndServe serves HTTP requests from the given TCP4 addr.
 //
 // Pass custom listener to Serve if you need listening on non-TCP4 media
@@ -1262,6 +1323,9 @@ func (s *Server) Serve(ln net.Listener) error {
 			}
 			return err
 		}
+
+		s.setState(c, StateNew)
+
 		if !wp.Serve(c) {
 			s.writeFastError(c, StatusServiceUnavailable,
 				"The connection cannot be served because Server.Concurrency limit exceeded")
@@ -1450,6 +1514,7 @@ func (s *Server) serveConn(c net.Conn) error {
 		connectionClose bool
 		isHTTP11        bool
 	)
+
 	for {
 		connRequestNum++
 		ctx.time = currentTime
@@ -1480,6 +1545,8 @@ func (s *Server) serveConn(c net.Conn) error {
 			if br.Buffered() == 0 || err != nil {
 				releaseReader(s, br)
 				br = nil
+			} else {
+				s.setState(c, StateActive)
 			}
 		}
 
@@ -1624,6 +1691,8 @@ func (s *Server) serveConn(c net.Conn) error {
 			break
 		}
 
+		s.setState(c, StateIdle)
+
 		currentTime = time.Now()
 	}
 
@@ -1634,6 +1703,10 @@ func (s *Server) serveConn(c net.Conn) error {
 		releaseWriter(s, bw)
 	}
 	s.releaseCtx(ctx)
+	if err != errHijacked {
+		s.setState(c, StateClosed)
+	}
+
 	return err
 }
 
@@ -1692,11 +1765,14 @@ func (s *Server) updateWriteDeadline(c net.Conn, ctx *RequestCtx, lastDeadlineTi
 
 func hijackConnHandler(r io.Reader, c net.Conn, s *Server, h HijackHandler) {
 	hjc := s.acquireHijackConn(r, c)
+
+	s.setState(c, StateHijacked)
 	h(hjc)
 
 	if br, ok := r.(*bufio.Reader); ok {
 		releaseReader(s, br)
 	}
+
 	c.Close()
 	s.releaseHijackConn(hjc)
 }
